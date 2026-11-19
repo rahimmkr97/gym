@@ -520,7 +520,7 @@ let searchT;
 $('#searchInput').addEventListener('input', e => { clearTimeout(searchT); const q = e.target.value; searchT = setTimeout(() => renderSearch(q), 150); });
 
 function foodRow(f, extra){
-  const per = f.serving && f.serving.g ? `${esc(f.serving.label || '1 serving')} (${r1(f.serving.g)} g) · ${r0(f.per100.kcal * f.serving.g/100)} kcal` : `100 g · ${r0(f.per100.kcal)} kcal`;
+  const per = !f.per100 ? 'Tap to load nutrition' : f.serving && f.serving.g ? `${esc(f.serving.label || '1 serving')} (${r1(f.serving.g)} g) · ${r0(f.per100.kcal * f.serving.g/100)} kcal` : `100 g · ${r0(f.per100.kcal)} kcal`;
   const th = f.img ? `<img src="${esc(f.img)}" alt="" loading="lazy" onerror="this.remove()">` : (f.emoji || '🍽️');
   return `<div class="item" data-food="${esc(f.id)}" ${extra||''}><div class="thumb">${th}</div><div class="n"><div>${esc(f.name)}</div><div class="sub">${f.brand ? esc(f.brand)+' · ' : ''}${per}</div></div><button class="plus">+</button></div>`;
 }
@@ -550,7 +550,8 @@ const onlineCache = {};
 function bindFoodRows(box){
   box.querySelectorAll('[data-food]').forEach(r => r.onclick = () => {
     const f = getFood(r.dataset.food) || onlineCache[r.dataset.food];
-    if (f) openAmount(f);
+    if (!f) return;
+    if (f.needsLoad) loadFullProduct(f); else openAmount(f);
   });
 }
 
@@ -572,19 +573,64 @@ function parseOFF(p){
     img: p.image_front_small_url || '', src:'off'
   };
 }
+// fetch with a time limit so a slow server never hangs the app
+async function getJSON(url, ms){
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try { const r = await fetch(url, {signal:ctl.signal}); if (!r.ok) throw new Error('HTTP '+r.status); return await r.json(); }
+  finally { clearTimeout(t); }
+}
+// Search-a-licious returns some text fields per language; pick the best one
+const txt = v => { if (v == null) return ''; if (typeof v === 'string') return v; if (Array.isArray(v)) return v.map(txt).filter(Boolean).join(', ');
+  if (typeof v === 'object') return v.main || v.fr || v.en || v.ar || Object.values(v).map(txt).find(Boolean) || ''; return String(v); };
+function parseHit(h){
+  const p = Object.assign({}, h, {
+    code: h.code, product_name: txt(h.product_name) || txt(h.generic_name),
+    brands: Array.isArray(h.brands) ? h.brands.join(',') : txt(h.brands),
+    image_front_small_url: h.image_front_small_url || ''
+  });
+  const f = parseOFF(p);
+  if (f) return f;
+  // no nutrition in the search result – show it anyway and load details on tap
+  if (!h.code || !p.product_name) return null;
+  return {id:'off_'+h.code, barcode:h.code, name:p.product_name.trim(), brand:(p.brands||'').split(',')[0].trim(), per100:null, img:p.image_front_small_url, src:'off', needsLoad:true};
+}
 async function onlineSearch(q){
   const box = $('#onlineRes');
-  box.innerHTML = '<div class="spin"></div>';
+  box.innerHTML = '<div class="spin"></div><p class="note" style="text-align:center">Searching Open Food Facts…</p>';
+  let items = null, lastErr = null;
+  // 1) new search service (fast, made for apps)
   try {
-    const url = `${OFF}/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=25&fields=${FIELDS}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(res.status);
-    const j = await res.json();
-    const items = (j.products||[]).map(parseOFF).filter(Boolean);
-    items.forEach(f => onlineCache[f.id] = f);
-    box.innerHTML = items.length ? `<div class="list-h">Open Food Facts</div><div class="list">${items.map(f => foodRow(f)).join('')}</div>` : `<div class="empty">No products found online.</div>`;
-    bindFoodRows(box);
-  } catch(e) { box.innerHTML = `<div class="empty">Couldn't reach Open Food Facts. Check your connection.</div>`; }
+    const j = await getJSON(`https://search.openfoodfacts.org/search?q=${encodeURIComponent(q)}&page_size=25&langs=fr,en,ar&fields=${FIELDS},generic_name`, 9000);
+    items = (j.hits || []).map(parseHit).filter(Boolean);
+  } catch(e) { lastErr = e; }
+  // 2) fall back to the old endpoint
+  if (!items || !items.length) {
+    try {
+      const j = await getJSON(`${OFF}/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=25&fields=${FIELDS}`, 15000);
+      const old = (j.products || []).map(parseOFF).filter(Boolean);
+      if (old.length || !items) items = old;
+    } catch(e) { lastErr = e; }
+  }
+  if (!items) {
+    const offline = !navigator.onLine;
+    box.innerHTML = `<div class="empty">${offline ? "You're offline. Connect to the internet to search online." : "Open Food Facts is busy right now. Wait a minute and try again, or scan the barcode instead (barcode lookups are much more reliable)."}</div><button class="btn block" id="retryOnline">Try again</button>`;
+    $('#retryOnline').onclick = () => onlineSearch(q);
+    console.warn('OFF search failed', lastErr);
+    return;
+  }
+  items.forEach(f => onlineCache[f.id] = f);
+  box.innerHTML = items.length ? `<div class="list-h">Open Food Facts</div><div class="list">${items.map(f => foodRow(f)).join('')}</div>` : `<div class="empty">No products found online for “${esc(q)}”. Try fewer words, the brand name, or French (e.g. “yaourt”).</div>`;
+  bindFoodRows(box);
+}
+async function loadFullProduct(f){
+  showModal(`<div class="spin"></div><p class="note" style="text-align:center">Loading ${esc(f.name)}…</p>`);
+  try {
+    const j = await getJSON(`${OFF}/api/v2/product/${f.barcode}.json?fields=${FIELDS}`, 12000);
+    const full = j && j.status === 1 && j.product ? parseOFF(Object.assign({code:f.barcode}, j.product)) : null;
+    if (full) { onlineCache[full.id] = full; openAmount(full); }
+    else { hideModal(); openFoodForm({name:f.name, brand:f.brand, barcode:f.barcode}, "This product has no nutrition values online yet. Copy them from the label once and they'll be saved."); }
+  } catch(e) { hideModal(); toast("Couldn't load this product – try again"); }
 }
 async function lookupBarcode(code){
   code = String(code).replace(/\D/g,'');
@@ -593,8 +639,9 @@ async function lookupBarcode(code){
   if (local) { closeSheet('scanSheet'); openAmount(local); return; }
   showModal(`<div class="spin"></div><p class="note" style="text-align:center">Looking up ${esc(code)}…</p>`);
   try {
-    const res = await fetch(`${OFF}/api/v2/product/${code}.json?fields=${FIELDS}`);
-    const j = res.ok ? await res.json() : null;
+    let j = null;
+    try { j = await getJSON(`${OFF}/api/v2/product/${code}.json?fields=${FIELDS}`, 12000); }
+    catch(err) { if (!/HTTP 404/.test(String(err))) throw err; }
     const f = j && j.status === 1 && j.product ? parseOFF(Object.assign({code}, j.product)) : null;
     closeSheet('scanSheet');
     if (f) { S.foods[f.id] = f; save(); openAmount(f); }
